@@ -79,6 +79,11 @@ RELEASE_NOTES_*.md
 开发文档.md
 构建个人知识管理Agent系统*.md
 
+# 开发计划文档（不需要提交到远程仓库）
+STAGE2_PLAN.md
+STAGE2_PLAN_REVISED.md
+docs/未实现功能清单.md
+
 # 保留的文档
 # README.md
 # CHANGELOG-*.md

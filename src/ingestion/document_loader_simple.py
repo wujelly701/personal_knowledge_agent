@@ -124,7 +124,11 @@ class DocumentLoader:
             elif file_extension == ".txt":
                 content = self._extract_text_text(file_path)
             else:
-                raise ValueError(f"未实现处理逻辑: {file_extension}")
+                supported = ", ".join(settings.SUPPORTED_FILE_TYPES)
+                raise ValueError(
+                    f"不支持的文件类型: {file_extension}. "
+                    f"支持的格式: {supported}"
+                )
             
             # 分割文档
             chunks = simple_text_splitter(content, self.chunk_size, self.chunk_overlap)
@@ -216,15 +220,49 @@ class DocumentLoader:
             return file.read()
 
 class DocumentClassifier:
-    """文档分类器"""
+    """文档分类器 - 改进版：多维度分类"""
     
     def __init__(self):
         self.categories = settings.DOCUMENT_CATEGORIES
         self.priorities = settings.PRIORITY_LEVELS
+        
+        # 增强的分类规则：权重 + 关键词
+        self.category_rules = {
+            "工作": {
+                "keywords": ["项目", "会议", "工作", "任务", "计划", "报告", "需求", "deadline", "团队", "客户"],
+                "weight": 1.0,
+                "patterns": ["todo", "meeting", "project"]
+            },
+            "学习": {
+                "keywords": ["学习", "教程", "课程", "笔记", "知识", "技能", "练习", "章节", "总结", "复习"],
+                "weight": 1.0,
+                "patterns": ["python", "java", "编程", "algorithm"]
+            },
+            "个人": {
+                "keywords": ["日记", "想法", "感悟", "生活", "家庭", "个人", "心情", "日程", "schedule"],
+                "weight": 0.9,
+                "patterns": ["diary", "daily", "schedule"]
+            },
+            "参考": {
+                "keywords": ["参考", "文档", "手册", "指南", "规范", "标准", "资料", "api", "documentation"],
+                "weight": 0.8,
+                "patterns": ["reference", "guide", "manual"]
+            },
+            "研究": {
+                "keywords": ["研究", "分析", "实验", "数据", "结论", "发现", "探索", "论文", "方法"],
+                "weight": 1.0,
+                "patterns": ["research", "analysis", "experiment"]
+            },
+            "想法": {
+                "keywords": ["想法", "创意", "创新", "设计", "概念", "思路", "灵感", "brainstorm"],
+                "weight": 0.9,
+                "patterns": ["idea", "innovation", "creative"]
+            }
+        }
     
     def classify_document(self, document: LangChainDocument) -> Dict[str, Any]:
         """
-        对文档进行分类
+        对文档进行多维度分类
         
         Args:
             document: 文档对象
@@ -232,48 +270,83 @@ class DocumentClassifier:
         Returns:
             分类结果字典
         """
-        # 简单的基于关键词的分类规则
         content = document.page_content.lower()
+        filename = document.metadata.get('filename', '').lower()
         
-        category_rules = {
-            "工作": ["项目", "会议", "工作", "任务", "计划", "报告", "需求"],
-            "学习": ["学习", "教程", "课程", "笔记", "知识", "技能", "练习"],
-            "个人": ["日记", "想法", "感悟", "生活", "家庭", "个人", "心情"],
-            "参考": ["参考", "文档", "手册", "指南", "规范", "标准", "资料"],
-            "研究": ["研究", "分析", "实验", "数据", "结论", "发现", "探索"],
-            "想法": ["想法", "创意", "创新", "设计", "概念", "思路", "灵感"]
+        # 1. 基于文件名的初步判断
+        filename_scores = {}
+        for category, rule in self.category_rules.items():
+            score = 0
+            for pattern in rule['patterns']:
+                if pattern in filename:
+                    score += 2.0  # 文件名匹配权重更高
+            filename_scores[category] = score
+        
+        # 2. 基于内容的关键词匹配
+        content_scores = {}
+        for category, rule in self.category_rules.items():
+            score = 0
+            keywords = rule['keywords']
+            weight = rule['weight']
+            
+            # 计算关键词出现次数
+            for keyword in keywords:
+                count = content.count(keyword)
+                score += count * weight
+            
+            # 归一化：除以内容长度，避免长文档得分过高
+            content_length = len(content.split())
+            if content_length > 0:
+                score = score / (content_length / 100)  # 每100词归一化
+            
+            content_scores[category] = score
+        
+        # 3. 综合得分
+        final_scores = {}
+        for category in self.category_rules.keys():
+            final_scores[category] = filename_scores.get(category, 0) * 0.4 + content_scores.get(category, 0) * 0.6
+        
+        # 4. 选择得分最高的类别
+        if final_scores and max(final_scores.values()) > 0:
+            category = max(final_scores, key=final_scores.get)
+            confidence = final_scores[category] / (sum(final_scores.values()) + 0.001)  # 避免除0
+        else:
+            category = "参考"  # 默认类别
+            confidence = 0.3
+        
+        # 5. 根据内容确定优先级
+        priority_keywords = {
+            "高": ["重要", "urgent", "紧急", "asap", "高优先级", "critical"],
+            "中": ["todo", "待办", "计划", "scheduled"],
+            "低": []
         }
         
-        scores = {}
-        for category, keywords in category_rules.items():
-            score = sum(1 for keyword in keywords if keyword in content)
-            scores[category] = score
+        priority = "低"  # 默认
+        for pri, keywords in priority_keywords.items():
+            if any(kw in content for kw in keywords):
+                priority = pri
+                break
         
-        # 选择得分最高的类别
-        if scores:
-            category = max(scores, key=scores.get)
-            if scores[category] == 0:
-                category = "参考"  # 默认类别
-        else:
-            category = "参考"
-        
-        # 根据内容确定优先级
-        if "重要" in content or "urgent" in content or "紧急" in content:
-            priority = "高"
-        elif len(content) > 2000:
+        # 如果内容很长，默认中优先级
+        if priority == "低" and len(content) > 2000:
             priority = "中"
-        else:
-            priority = "低"
         
-        # 生成简短摘要
+        # 6. 生成简短摘要
         summary = content[:100] + "..." if len(content) > 100 else content
+        
+        # 7. 提取关键词
+        keywords = self._extract_keywords(content)
+        
+        # 8. 将分类得分转换为字符串（ChromaDB metadata 不支持嵌套字典）
+        scores_str = "; ".join([f"{k}:{v:.2f}" for k, v in final_scores.items() if v > 0])
         
         return {
             "category": category,
             "priority": priority,
             "summary": summary,
-            "tags": ",".join(self._extract_keywords(content)),  # 将标签转换为字符串
-            "confidence": scores.get(category, 0) / max(len(content.split()) / 100, 1)
+            "tags": ",".join(keywords),
+            "confidence": round(confidence, 3),
+            "classification_scores": scores_str  # ✅ 字符串格式，如 "工作:5.81; 学习:3.55"
         }
     
     def _extract_keywords(self, content: str) -> List[str]:

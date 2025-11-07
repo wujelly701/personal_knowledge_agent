@@ -12,6 +12,7 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 from langchain_core.documents import Document as LangChainDocument
 from config.settings import settings
+from rank_bm25 import BM25Okapi
 
 # 尝试导入embedding管理器
 try:
@@ -94,7 +95,7 @@ class VectorStore:
                 self.embedding_manager = EmbeddingManager(optimal_method)
                 self.embeddings = self.embedding_manager
                 method_info = self.embedding_manager.get_method_info()
-                logger.info(f"✅ 使用{'' if 'openai' not in method_info['method'] else '免费'}Embedding方案: {method_info['description']}")
+                logger.info(f"✅ 使用Embedding方案: {method_info['description']}")
                 return
             except Exception as e:
                 logger.warning(f"免费Embedding管理器初始化失败: {e}")
@@ -321,18 +322,33 @@ class VectorStore:
         删除文档
         
         Args:
-            filter_dict: 删除条件
+            filter_dict: 删除条件（如 {"filename": "test.md"}）
             
         Returns:
             是否删除成功
         """
         try:
+            # 构建查询条件
             where_clause = {}
             for key, value in filter_dict.items():
                 where_clause[key] = {"$eq": value}
             
-            self.collection.delete(where=where_clause)
-            logger.info(f"删除文档成功: {filter_dict}")
+            # 先查询要删除的文档数量
+            try:
+                existing_docs = self.collection.get(where=where_clause)
+                doc_count = len(existing_docs['ids']) if existing_docs and 'ids' in existing_docs else 0
+                logger.info(f"找到 {doc_count} 个匹配的文档块准备删除")
+            except Exception as e:
+                logger.warning(f"查询待删除文档失败: {e}")
+                doc_count = 0
+            
+            # 执行删除
+            if doc_count > 0:
+                self.collection.delete(where=where_clause)
+                logger.info(f"删除文档成功: {filter_dict}, 删除了 {doc_count} 个文档块")
+            else:
+                logger.warning(f"未找到匹配的文档: {filter_dict}")
+            
             return True
             
         except Exception as e:
@@ -457,10 +473,71 @@ class HybridRetriever:
             return self.vector_store.search(query, k=k, filter_dict=filter_dict)
     
     def _keyword_search(self, query: str, k: int, filter_dict: Optional[Dict]) -> List[LangChainDocument]:
-        """简单的关键词搜索"""
-        # TODO: 实现BM25或其他关键词搜索算法
-        # 暂时返回空列表
-        return []
+        """BM25关键词搜索"""
+        try:
+            # 1. 获取所有文档
+            all_docs = self.vector_store.collection.get()
+
+            if not all_docs['documents']:
+                return []
+
+            # 2. 应用元数据过滤
+            filtered_docs = []
+            filtered_metadatas = []
+            filtered_ids = []
+
+            for i, (doc, metadata, doc_id) in enumerate(zip(
+                all_docs['documents'],
+                all_docs['metadatas'],
+                all_docs['ids']
+            )):
+                # 元数据过滤
+                if filter_dict:
+                    match = all(
+                        metadata.get(key) == value
+                        for key, value in filter_dict.items()
+                    )
+                    if not match:
+                        continue
+
+                filtered_docs.append(doc)
+                filtered_metadatas.append(metadata)
+                filtered_ids.append(doc_id)
+            
+            if not filtered_docs:
+                return []
+
+            # 3. 构建BM25索引
+            tokenized_docs = [doc.lower().split() for doc in filtered_docs]
+            bm25 = BM25Okapi(tokenized_docs)
+
+            # 4. 搜索
+            query_tokens = query.lower().split()
+            scores = bm25.get_scores(query_tokens)
+
+            # 5. 返回Top-K
+            top_indices = np.argsort(scores)[::-1][:k]
+
+            # 6. 构建结果
+            results = []
+            for idx in top_indices:
+                doc = LangChainDocument(
+                    page_content=filtered_docs[idx],
+                    metadata={
+                        **filtered_metadatas[idx],
+                        "bm25_score": float(scores[idx]),
+                        "keyword_relevance": min(scores[idx] / 10.0, 1.0),
+                        "doc_id": filtered_ids[idx]
+                    }
+                )
+                results.append(doc)
+
+            logger.info(f"BM25关键词搜索完成: 查询='{query}', 结果数量={len(results)}")
+            logger.debug(f"BM25得分: {[r.metadata['bm25_score'] for r in results]}")
+            return results
+        except Exception as e:
+            logger.error(f"BM25搜索失败: {str(e)}")
+            return []
     
     def _fusion_results(self, query: str, vector_results: List[LangChainDocument], 
                        keyword_results: List[LangChainDocument], 

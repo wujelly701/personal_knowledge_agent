@@ -14,8 +14,7 @@ from src.ingestion.document_loader_simple import DocumentLoader, DocumentClassif
 from src.storage.vector_store_simple import VectorStore, HybridRetriever
 from src.generation.llm_manager import LLMManager, RAGGenerator, ModelRouter
 
-# 配置日志
-logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL))
+# 获取日志器（日志已在main.py中统一配置）
 logger = logging.getLogger(__name__)
 
 
@@ -75,16 +74,61 @@ class KnowledgeManagerApp:
 
             # 批量处理文件
             all_documents = []
+            processed_files = []
+            skipped_files = []
+            updated_files = []
+            
             for file_path in files:
                 try:
+                    # 获取文件名
+                    file_name = Path(file_path).name
+                    
+                    # 检查是否已存在同名文档
+                    existing_docs = self.vector_store.collection.get()
+                    file_exists = False
+                    if existing_docs['metadatas']:
+                        for metadata in existing_docs['metadatas']:
+                            if metadata.get('filename') == file_name:
+                                file_exists = True
+                                break
+                    
+                    # 如果文件已存在，计算内容哈希判断是否相同
+                    if file_exists:
+                        # 读取新文件内容计算哈希
+                        with open(file_path, 'rb') as f:
+                            import hashlib
+                            new_content_hash = hashlib.md5(f.read()).hexdigest()
+                        
+                        # 获取旧文件的哈希（从第一个块的metadata中）
+                        old_hash = None
+                        for i, metadata in enumerate(existing_docs['metadatas']):
+                            if metadata.get('filename') == file_name:
+                                # 尝试从文档内容生成哈希
+                                old_content = existing_docs['documents'][i] if i < len(existing_docs['documents']) else ""
+                                old_hash = hashlib.md5(old_content.encode('utf-8')).hexdigest()
+                                break
+                        
+                        # 比较哈希值
+                        if new_content_hash == old_hash:
+                            # 内容完全相同，跳过处理
+                            logger.info(f"文件内容未变化，跳过: {file_name}")
+                            skipped_files.append(file_name)
+                            continue
+                        else:
+                            # 内容不同，删除旧版本，添加新版本
+                            logger.info(f"检测到文件内容变化，更新: {file_name}")
+                            self.vector_store.delete_documents({"filename": file_name})
+                            updated_files.append(file_name)
+                    
                     documents = self.document_loader.load_file(file_path)
 
-                    # 为每个文档添加分类信息
+                    # 为每个文档添加分类信息和文件哈希
                     for doc in documents:
                         classification = self.document_classifier.classify_document(doc)
                         doc.metadata.update(classification)
 
                     all_documents.extend(documents)
+                    processed_files.append(file_name)
 
                 except Exception as e:
                     logger.warning(f"文件处理失败 {file_path}: {str(e)}")
@@ -94,9 +138,27 @@ class KnowledgeManagerApp:
             if all_documents:
                 success = self.vector_store.add_documents(all_documents)
                 if success:
-                    result = f"✅ 成功处理 {len(all_documents)} 个文档块\n"
-                    result += f"📊 处理详情：\n"
-                    result += f"  您的文档被自动分割成 {len(all_documents)} 个可管理的文本块\n"
+                    result = f"✅ 成功处理 {len(all_documents)} 个文档块\n\n"
+                    
+                    # 显示处理统计
+                    if processed_files:
+                        result += f"📄 **新增文件**: {len(processed_files)} 个\n"
+                        for fname in processed_files[:5]:  # 只显示前5个
+                            result += f"  • {fname}\n"
+                        if len(processed_files) > 5:
+                            result += f"  • ... 还有 {len(processed_files)-5} 个\n"
+                    
+                    if updated_files:
+                        result += f"\n🔄 **更新文件**: {len(updated_files)} 个（内容已变化）\n"
+                        for fname in updated_files:
+                            result += f"  • {fname}\n"
+                    
+                    if skipped_files:
+                        result += f"\n⏭️ **跳过文件**: {len(skipped_files)} 个（内容未变化）\n"
+                        for fname in skipped_files:
+                            result += f"  • {fname}\n"
+                    
+                    result += f"\n📊 **文档分类统计**：\n"
 
                     # 统计分类信息
                     categories = {}
@@ -107,19 +169,22 @@ class KnowledgeManagerApp:
                     for category, count in categories.items():
                         category_desc = {
                             "工作": "与工作相关的文档内容",
+                            "学习": "学习笔记或教程",
                             "研究": "研究或学术相关的内容",
                             "参考": "参考资料或引用内容",
                             "想法": "个人见解或创意想法",
+                            "个人": "个人日常或生活记录",
                             "未知": "未分类的内容"
                         }.get(category, "其他分类内容")
 
-                        result += f"  \n  • {category}: {count} 个"
-                        result += f" ({category_desc})"
+                        result += f"  • {category}: {count} 个块 ({category_desc})\n"
 
-                    result += f"\n\n💡 这些文档块现在已经存储在知识库中，可以通过智能问答功能进行查询和对话。"
+                    result += f"\n💡 这些文档块现在已经存储在知识库中，可以通过智能问答功能进行查询和对话。"
                     return result
                 else:
                     return "❌ 文件处理失败，请重试。"
+            elif skipped_files:
+                return f"⏭️ 已跳过 {len(skipped_files)} 个文件（内容未变化，无需重新处理）\n" + "\n".join(f"  • {f}" for f in skipped_files)
             else:
                 return "⚠️ 没有成功处理任何文件。"
 
@@ -263,7 +328,7 @@ class KnowledgeManagerApp:
             for i, doc in enumerate(documents, 1):
                 filename = doc.metadata.get('filename', '未知文件')
                 category = doc.metadata.get('category', '未分类')
-                chunk_id = doc.metadata.get('chunk_id', '?')
+                chunk_id = doc.metadata.get('chunk_id', 0)
                 total_chunks = doc.metadata.get('total_chunks', '?')
                 relevance = doc.metadata.get('relevance_score', 0.0)
                 
@@ -271,7 +336,7 @@ class KnowledgeManagerApp:
                 if len(doc.page_content) > 200:
                     content_preview += "..."
 
-                result += f"**{i}. {filename}** (第{chunk_id}/{total_chunks}块 | {category})\n"
+                result += f"**{i}. {filename}** (第{chunk_id + 1}/{total_chunks}块 | {category})\n"
                 result += f"   📊 相关性: {relevance:.2f}\n"
                 result += f"   📝 内容预览: {content_preview}\n\n"
 
@@ -501,6 +566,9 @@ class KnowledgeManagerApp:
                         self.load_and_process_files,
                         inputs=[file_input],
                         outputs=[upload_status]
+                    ).then(
+                        lambda: None,  # 上传成功后清空文件选择器
+                        outputs=[file_input]
                     )
 
                 # Tab 2: 智能问答
@@ -756,6 +824,9 @@ class KnowledgeManagerApp:
                     ).then(
                         refresh_file_list,  # 删除后自动刷新列表
                         outputs=[file_list_display]
+                    ).then(
+                        lambda: "",  # 删除后清空输入框
+                        outputs=[delete_filename_input]
                     )
                     
                     update_btn.click(
@@ -765,6 +836,9 @@ class KnowledgeManagerApp:
                     ).then(
                         refresh_file_list,  # 更新后自动刷新列表
                         outputs=[file_list_display]
+                    ).then(
+                        lambda: ("", None),  # 更新后清空输入框和文件选择器
+                        outputs=[update_filename_input, update_file_input]
                     )
 
             # 页脚

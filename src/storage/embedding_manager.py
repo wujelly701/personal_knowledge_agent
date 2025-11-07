@@ -12,7 +12,16 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class EmbeddingManager:
-    """多方案Embedding管理器"""
+    """多方案Embedding管理器 - 使用单例模式"""
+    
+    _instance = None  # 单例实例
+    _initialized = False  # 是否已初始化
+    
+    def __new__(cls, preferred_method: str = "all-MiniLM-L6-v2"):
+        """单例模式：确保只创建一个实例"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
     
     def __init__(self, preferred_method: str = "all-MiniLM-L6-v2"):
         """
@@ -26,12 +35,22 @@ class EmbeddingManager:
             - "huggingface-embeddings": Hugging Face免费模型
             - "bert-base-nli-mean-tokens": BERT嵌入
         """
+        # 单例模式：只初始化一次
+        if EmbeddingManager._initialized:
+            return
+            
         self.preferred_method = preferred_method
         self.method = None
         self.model = None
         self.embedding_dim = 0
         
+        # 添加缓存机制
+        self.embedding_cache = {}  # 用于缓存已计算的embedding
+        self.cache_enabled = True  # 缓存开关
+        self.max_cache_size = 1000  # 最大缓存数量
+        
         self._initialize_embedding_method()
+        EmbeddingManager._initialized = True
     
     def _initialize_embedding_method(self):
         """初始化embedding方法"""
@@ -144,7 +163,7 @@ class EmbeddingManager:
     
     def embed_query(self, text: str) -> List[float]:
         """
-        生成查询文本embedding
+        生成查询文本embedding (带缓存)
         
         Args:
             text: 查询文本
@@ -152,7 +171,31 @@ class EmbeddingManager:
         Returns:
             embedding向量
         """
+        # 检查缓存
+        if self.cache_enabled:
+            cache_key = hashlib.md5(text.encode('utf-8')).hexdigest()
+            
+            if cache_key in self.embedding_cache:
+                logger.debug(f"使用缓存的embedding: {text[:30]}...")
+                return self.embedding_cache[cache_key]
+        
+        # 生成embedding
         embeddings = self.embed_documents([text])
+        result = embeddings[0] if embeddings else [0.0] * self.embedding_dim
+        
+        # 缓存结果
+        if self.cache_enabled:
+            # 如果缓存已满，清理最旧的一半
+            if len(self.embedding_cache) >= self.max_cache_size:
+                keys_to_remove = list(self.embedding_cache.keys())[:self.max_cache_size // 2]
+                for key in keys_to_remove:
+                    del self.embedding_cache[key]
+                logger.debug(f"缓存已满，清理了 {len(keys_to_remove)} 个旧条目")
+            
+            self.embedding_cache[cache_key] = result
+            logger.debug(f"缓存了新的embedding (缓存大小: {len(self.embedding_cache)})")
+        
+        return result
         return embeddings[0] if embeddings else [0.0] * self.embedding_dim
     
     def _embed_sentence_transformers(self, texts: List[str]) -> List[List[float]]:
@@ -269,3 +312,23 @@ class EmbeddingManager:
             }
         ]
         return methods
+    
+    def clear_cache(self):
+        """清空embedding缓存"""
+        cache_size = len(self.embedding_cache)
+        self.embedding_cache.clear()
+        logger.info(f"已清空embedding缓存 (清理了 {cache_size} 个条目)")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        return {
+            "cache_enabled": self.cache_enabled,
+            "cache_size": len(self.embedding_cache),
+            "max_cache_size": self.max_cache_size,
+            "cache_hit_rate": "N/A"  # 可以后续添加命中率统计
+        }
+    
+    def set_cache_enabled(self, enabled: bool):
+        """设置缓存开关"""
+        self.cache_enabled = enabled
+        logger.info(f"Embedding缓存{'已启用' if enabled else '已禁用'}")
