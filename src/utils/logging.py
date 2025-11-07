@@ -29,13 +29,17 @@ def setup_logging():
     
     root_logger.setLevel(getattr(logging, settings.LOG_LEVEL))
     
-    # 文件处理器
-    file_handler = logging.handlers.RotatingFileHandler(
+    # 使用TimedRotatingFileHandler - 每天创建新日志文件
+    from logging.handlers import TimedRotatingFileHandler
+    
+    file_handler = TimedRotatingFileHandler(
         log_dir / "app.log",
-        maxBytes=10*1024*1024,  # 10MB
-        backupCount=5,
+        when='midnight',  # 每天午夜轮转
+        interval=1,  # 每1天
+        backupCount=7,  # 保留7天的日志
         encoding='utf-8'
     )
+    file_handler.suffix = "%Y-%m-%d"  # 备份文件名格式: app.log.2025-11-08
     file_handler.setFormatter(formatter)
     file_handler.setLevel(getattr(logging, settings.LOG_LEVEL))
     root_logger.addHandler(file_handler)

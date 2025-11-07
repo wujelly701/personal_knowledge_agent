@@ -205,12 +205,16 @@ class DocumentClassifier:
         # 生成简短摘要
         summary = content[:100] + "..." if len(content) > 100 else content
         
+        # 提取关键词并转换为字符串
+        keywords = self._extract_keywords(content)
+        
         return {
             "category": category,
             "priority": priority,
             "summary": summary,
-            "tags": self._extract_keywords(content),
-            "confidence": scores.get(category, 0) / max(len(content.split()) / 100, 1)
+            "tags": ",".join(keywords),  # ✅ 转换为字符串
+            "confidence": round(scores.get(category, 0) / max(len(content.split()) / 100, 1), 3),
+            "classification_scores": "; ".join([f"{k}:{v}" for k, v in scores.items() if v > 0])  # ✅ 添加scores作为字符串
         }
     
     def _extract_keywords(self, content: str) -> List[str]:

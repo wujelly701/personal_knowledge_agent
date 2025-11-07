@@ -5,6 +5,7 @@ LLM集成模块
 
 import os
 import logging
+import time
 from typing import List, Optional, Dict, Any, Union
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_deepseek import ChatDeepSeek
@@ -13,6 +14,11 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# 重试配置
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # 初始重试延迟（秒）
+TIMEOUT = 30  # API调用超时（秒）
 
 class LLMManager:
     """LLM管理器"""
@@ -68,7 +74,7 @@ class LLMManager:
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
-        为文档生成embedding
+        为文档生成embedding（带重试机制）
 
         Args:
             texts: 文本列表
@@ -76,28 +82,49 @@ class LLMManager:
         Returns:
             embedding向量列表
         """
-        try:
-            # 检查是否使用OpenAI模型
-            if hasattr(self.embedding_model, 'embed_documents') and not hasattr(self.embedding_model, 'get_method_info'):
-                # OpenAI模型
-                embeddings = self.embedding_model.embed_documents(texts)
-            else:
-                # 本地embedding管理器
-                embeddings = self.embedding_model.embed_documents(texts)
+        retries = 0
+        last_error = None
+        
+        while retries < MAX_RETRIES:
+            try:
+                # 检查是否使用OpenAI模型
+                if hasattr(self.embedding_model, 'embed_documents') and not hasattr(self.embedding_model, 'get_method_info'):
+                    # OpenAI模型 - 可能有网络问题
+                    embeddings = self.embedding_model.embed_documents(texts)
+                else:
+                    # 本地embedding管理器 - 不需要重试
+                    embeddings = self.embedding_model.embed_documents(texts)
 
-            logger.info(f"生成了 {len(embeddings)} 个文档的embedding")
-            return embeddings
+                logger.info(f"生成了 {len(embeddings)} 个文档的embedding")
+                return embeddings
 
-        except Exception as e:
-            logger.error(f"生成embedding失败: {str(e)}")
-            # 回退到文本哈希
-            from src.storage.embedding_manager import EmbeddingManager
-            fallback_manager = EmbeddingManager("text-hash")
-            return fallback_manager.embed_documents(texts)
+            except Exception as e:
+                last_error = e
+                retries += 1
+                
+                # 判断是否需要重试
+                error_msg = str(e).lower()
+                is_network_error = any(keyword in error_msg for keyword in 
+                                     ['timeout', 'connection', 'network', 'rate limit', '429', '503', '504'])
+                
+                if is_network_error and retries < MAX_RETRIES:
+                    delay = RETRY_DELAY * (2 ** (retries - 1))  # 指数退避
+                    logger.warning(f"Embedding生成失败（网络错误），{delay}秒后重试 ({retries}/{MAX_RETRIES}): {str(e)}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"生成embedding失败: {str(e)}")
+                    break
+        
+        # 所有重试都失败，回退到文本哈希
+        logger.warning("使用文本哈希作为回退方案")
+        from src.storage.embedding_manager import EmbeddingManager
+        fallback_manager = EmbeddingManager("text-hash")
+        return fallback_manager.embed_documents(texts)
 
     def embed_query(self, text: str) -> List[float]:
         """
-        为查询生成embedding
+        为查询生成embedding（带重试机制）
 
         Args:
             text: 查询文本
@@ -105,23 +132,44 @@ class LLMManager:
         Returns:
             embedding向量
         """
-        try:
-            # 检查是否使用OpenAI模型
-            if hasattr(self.embedding_model, 'embed_query') and not hasattr(self.embedding_model, 'get_method_info'):
-                # OpenAI模型
-                embedding = self.embedding_model.embed_query(text)
-            else:
-                # 本地embedding管理器
-                embedding = self.embedding_model.embed_query(text)
+        retries = 0
+        last_error = None
+        
+        while retries < MAX_RETRIES:
+            try:
+                # 检查是否使用OpenAI模型
+                if hasattr(self.embedding_model, 'embed_query') and not hasattr(self.embedding_model, 'get_method_info'):
+                    # OpenAI模型
+                    embedding = self.embedding_model.embed_query(text)
+                else:
+                    # 本地embedding管理器
+                    embedding = self.embedding_model.embed_query(text)
 
-            return embedding
+                return embedding
 
-        except Exception as e:
-            logger.error(f"生成查询embedding失败: {str(e)}")
-            # 回退到文本哈希
-            from src.storage.embedding_manager import EmbeddingManager
-            fallback_manager = EmbeddingManager("text-hash")
-            return fallback_manager.embed_query(text)
+            except Exception as e:
+                last_error = e
+                retries += 1
+                
+                # 判断是否需要重试
+                error_msg = str(e).lower()
+                is_network_error = any(keyword in error_msg for keyword in 
+                                     ['timeout', 'connection', 'network', 'rate limit', '429', '503', '504'])
+                
+                if is_network_error and retries < MAX_RETRIES:
+                    delay = RETRY_DELAY * (2 ** (retries - 1))  # 指数退避
+                    logger.warning(f"查询embedding生成失败（网络错误），{delay}秒后重试 ({retries}/{MAX_RETRIES}): {str(e)}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"生成查询embedding失败: {str(e)}")
+                    break
+        
+        # 所有重试都失败，回退到文本哈希
+        logger.warning("使用文本哈希作为回退方案")
+        from src.storage.embedding_manager import EmbeddingManager
+        fallback_manager = EmbeddingManager("text-hash")
+        return fallback_manager.embed_query(text)
 
     def get_embedding_info(self) -> Dict[str, Any]:
         """获取embedding方法信息"""
@@ -187,7 +235,7 @@ class RAGGenerator:
     def generate_answer(self, query: str, documents: List[LangChainDocument], 
                        include_sources: bool = True) -> Dict[str, Any]:
         """
-        基于检索文档生成回答
+        基于检索文档生成回答（带重试机制）
         
         Args:
             query: 用户问题
@@ -197,57 +245,78 @@ class RAGGenerator:
         Returns:
             生成的回答信息
         """
-        try:
-            if not documents:
-                return {
-                    "answer": "抱歉，我在现有文档中没有找到相关信息。请尝试上传相关文档或重新表述问题。",
-                    "confidence": 0.0,
-                    "sources": [],
-                    "metadata": {"error": "no_documents_found"}
+        retries = 0
+        last_error = None
+        
+        while retries < MAX_RETRIES:
+            try:
+                if not documents:
+                    return {
+                        "answer": "抱歉，我在现有文档中没有找到相关信息。请尝试上传相关文档或重新表述问题。",
+                        "confidence": 0.0,
+                        "sources": [],
+                        "metadata": {"error": "no_documents_found"}
+                    }
+                
+                # 构建上下文
+                context = self._build_context(documents, include_sources)
+                
+                # 生成回答
+                messages = [
+                    SystemMessage(content=self.rag_system_prompt.format(
+                        context=context,
+                        question=query
+                    )),
+                    HumanMessage(content="请基于上述上下文回答问题。")
+                ]
+                
+                response = self.chat_model.invoke(messages)
+                answer = response.content if hasattr(response, 'content') else str(response)
+                
+                # 提取置信度
+                confidence = self._estimate_confidence(query, documents, answer)
+                
+                # 构建结果
+                result = {
+                    "answer": answer,
+                    "confidence": confidence,
+                    "sources": self._extract_sources(documents),
+                    "metadata": {
+                        "query": query,
+                        "retrieved_docs": len(documents),
+                        "model_used": settings.LLM_MODEL,
+                        "tokens_used": getattr(response, 'usage_metadata', {}).get('total_tokens', 0) if hasattr(response, 'usage_metadata') else 0
+                    }
                 }
-            
-            # 构建上下文
-            context = self._build_context(documents, include_sources)
-            
-            # 生成回答
-            messages = [
-                SystemMessage(content=self.rag_system_prompt.format(
-                    context=context,
-                    question=query
-                )),
-                HumanMessage(content="请基于上述上下文回答问题。")
-            ]
-            
-            response = self.chat_model.invoke(messages)
-            answer = response.content if hasattr(response, 'content') else str(response)
-            
-            # 提取置信度
-            confidence = self._estimate_confidence(query, documents, answer)
-            
-            # 构建结果
-            result = {
-                "answer": answer,
-                "confidence": confidence,
-                "sources": self._extract_sources(documents),
-                "metadata": {
-                    "query": query,
-                    "retrieved_docs": len(documents),
-                    "model_used": settings.LLM_MODEL,
-                    "tokens_used": getattr(response, 'usage_metadata', {}).get('total_tokens', 0) if hasattr(response, 'usage_metadata') else 0
-                }
-            }
-            
-            logger.info(f"RAG回答生成成功: 查询='{query[:30]}...', 置信度={confidence:.2f}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"RAG回答生成失败: {str(e)}")
-            return {
-                "answer": "抱歉，回答生成过程中出现错误。请稍后重试。",
-                "confidence": 0.0,
-                "sources": [],
-                "metadata": {"error": str(e)}
-            }
+                
+                logger.info(f"RAG回答生成成功: 查询='{query[:30]}...', 置信度={confidence:.2f}")
+                return result
+                
+            except Exception as e:
+                last_error = e
+                retries += 1
+                
+                # 判断是否需要重试
+                error_msg = str(e).lower()
+                is_network_error = any(keyword in error_msg for keyword in 
+                                     ['timeout', 'connection', 'network', 'rate limit', '429', '503', '504'])
+                
+                if is_network_error and retries < MAX_RETRIES:
+                    delay = RETRY_DELAY * (2 ** (retries - 1))  # 指数退避
+                    logger.warning(f"RAG生成失败（网络错误），{delay}秒后重试 ({retries}/{MAX_RETRIES}): {str(e)}")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"RAG回答生成失败: {str(e)}")
+                    break
+        
+        # 所有重试都失败
+        return {
+            "answer": f"抱歉，回答生成过程中出现错误。请稍后重试。\n错误信息：{str(last_error)}",
+            "confidence": 0.0,
+            "sources": [],
+            "metadata": {"error": str(last_error), "retries": retries}
+        }
     
     def classify_document(self, content: str) -> Dict[str, Any]:
         """

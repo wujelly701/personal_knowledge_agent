@@ -79,10 +79,26 @@ RELEASE_NOTES_*.md
 开发文档.md
 构建个人知识管理Agent系统*.md
 
+# Week实施报告和修复报告（临时文档）
+WEEK*_IMPLEMENTATION_REPORT.md
+WEEK*_FIX_REPORT.md
+FILE_UPLOAD_FIX_REPORT.md
+FINAL_FIX_REPORT.md
+SEARCH_*.md
+ISSUES_*.md
+
+# 测试覆盖率报告
+.coverage
+htmlcov/
+.pytest_cache/
+coverage.xml
+*.cover
+
 # 开发计划文档（不需要提交到远程仓库）
 STAGE2_PLAN.md
 STAGE2_PLAN_REVISED.md
 docs/未实现功能清单.md
+user_files/windows重定向方法.md
 
 # 保留的文档
 # README.md

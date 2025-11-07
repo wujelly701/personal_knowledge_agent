@@ -13,6 +13,7 @@ from config.settings import settings
 from src.ingestion.document_loader_simple import DocumentLoader, DocumentClassifier
 from src.storage.vector_store_simple import VectorStore, HybridRetriever
 from src.generation.llm_manager import LLMManager, RAGGenerator, ModelRouter
+from src.utils.search_history import SearchHistoryManager
 
 # 获取日志器（日志已在main.py中统一配置）
 logger = logging.getLogger(__name__)
@@ -47,6 +48,9 @@ class KnowledgeManagerApp:
         except Exception as e:
             logger.warning(f"LLM功能初始化失败，将使用简化模式: {e}")
 
+        # 搜索历史管理器
+        self.search_history_manager = SearchHistoryManager()
+
         # 状态管理
         self.conversation_history = []
         self.current_session_id = None
@@ -66,9 +70,21 @@ class KnowledgeManagerApp:
         Returns:
             处理结果消息
         """
+        from src.utils.recovery import RecoveryManager
+        import os
+        
+        # 初始化恢复管理器
+        recovery_manager = RecoveryManager()
+        
         try:
             if not files:
                 return "请选择要上传的文件。"
+
+            # 文件大小限制 (50MB)
+            MAX_FILE_SIZE = 50 * 1024 * 1024
+            
+            # 支持的文件类型
+            SUPPORTED_EXTENSIONS = {'.txt', '.md', '.pdf', '.doc', '.docx'}
 
             logger.info(f"开始处理 {len(files)} 个文件")
 
@@ -77,11 +93,72 @@ class KnowledgeManagerApp:
             processed_files = []
             skipped_files = []
             updated_files = []
+            failed_files = []
             
             for file_path in files:
                 try:
                     # 获取文件名
                     file_name = Path(file_path).name
+                    # 保存哈希值变量
+                    new_content_hash = None
+                    
+                    # === 文件验证 ===
+                    # 1. 检查文件是否存在
+                    if not os.path.exists(file_path):
+                        logger.warning(f"文件不存在: {file_name}")
+                        failed_files.append((file_name, "文件不存在"))
+                        continue
+                    
+                    # 2. 检查文件类型
+                    file_ext = Path(file_path).suffix.lower()
+                    if file_ext not in SUPPORTED_EXTENSIONS:
+                        logger.warning(f"不支持的文件类型 {file_ext}: {file_name}")
+                        failed_files.append((file_name, f"不支持的文件类型 {file_ext}"))
+                        continue
+                    
+                    # 3. 检查文件大小
+                    try:
+                        file_size = os.path.getsize(file_path)
+                        if file_size > MAX_FILE_SIZE:
+                            size_mb = file_size / (1024 * 1024)
+                            logger.warning(f"文件过大 ({size_mb:.1f}MB): {file_name}")
+                            failed_files.append((file_name, f"文件过大 ({size_mb:.1f}MB，限制50MB)"))
+                            continue
+                        if file_size == 0:
+                            logger.warning(f"文件为空: {file_name}")
+                            failed_files.append((file_name, "文件为空"))
+                            continue
+                    except OSError as e:
+                        logger.error(f"无法读取文件大小 {file_name}: {str(e)}")
+                        failed_files.append((file_name, "无法读取文件大小"))
+                        continue
+                    
+                    # 4. 检查文件读取权限
+                    if not os.access(file_path, os.R_OK):
+                        logger.warning(f"没有文件读取权限: {file_name}")
+                        failed_files.append((file_name, "没有读取权限"))
+                        continue
+                    
+                    # === 保存处理检查点 ===
+                    recovery_manager.save_checkpoint('file_upload', {
+                        'file_name': file_name,
+                        'file_path': file_path,
+                        'stage': 'validation_passed'
+                    })
+                    
+                    # 计算新文件内容哈希（统一在此处计算）
+                    try:
+                        with open(file_path, 'rb') as f:
+                            import hashlib
+                            new_content_hash = hashlib.md5(f.read()).hexdigest()
+                    except PermissionError:
+                        logger.error(f"读取文件权限被拒绝: {file_name}")
+                        failed_files.append((file_name, "读取权限被拒绝"))
+                        continue
+                    except IOError as e:
+                        logger.error(f"文件读取错误 {file_name}: {str(e)}")
+                        failed_files.append((file_name, f"文件读取错误: {str(e)}"))
+                        continue
                     
                     # 检查是否已存在同名文档
                     existing_docs = self.vector_store.collection.get()
@@ -92,24 +169,18 @@ class KnowledgeManagerApp:
                                 file_exists = True
                                 break
                     
-                    # 如果文件已存在，计算内容哈希判断是否相同
+                    # 如果文件已存在，判断是否相同
                     if file_exists:
-                        # 读取新文件内容计算哈希
-                        with open(file_path, 'rb') as f:
-                            import hashlib
-                            new_content_hash = hashlib.md5(f.read()).hexdigest()
-                        
-                        # 获取旧文件的哈希（从第一个块的metadata中）
-                        old_hash = None
-                        for i, metadata in enumerate(existing_docs['metadatas']):
+                        # 获取旧文件的哈希（从该文件的任意一个块的metadata中读取file_hash）
+                        old_file_hash = None
+                        for metadata in existing_docs['metadatas']:
                             if metadata.get('filename') == file_name:
-                                # 尝试从文档内容生成哈希
-                                old_content = existing_docs['documents'][i] if i < len(existing_docs['documents']) else ""
-                                old_hash = hashlib.md5(old_content.encode('utf-8')).hexdigest()
+                                # 从metadata中读取文件级别的hash
+                                old_file_hash = metadata.get('file_hash')
                                 break
                         
                         # 比较哈希值
-                        if new_content_hash == old_hash:
+                        if new_content_hash == old_file_hash:
                             # 内容完全相同，跳过处理
                             logger.info(f"文件内容未变化，跳过: {file_name}")
                             skipped_files.append(file_name)
@@ -120,18 +191,40 @@ class KnowledgeManagerApp:
                             self.vector_store.delete_documents({"filename": file_name})
                             updated_files.append(file_name)
                     
+                    # === 加载文档 ===
+                    recovery_manager.save_checkpoint('file_upload', {
+                        'file_name': file_name,
+                        'stage': 'loading_document'
+                    })
+                    
                     documents = self.document_loader.load_file(file_path)
 
                     # 为每个文档添加分类信息和文件哈希
                     for doc in documents:
                         classification = self.document_classifier.classify_document(doc)
+                        # 清理None值（ChromaDB不接受None类型的metadata）
+                        classification = {k: v for k, v in classification.items() if v is not None}
                         doc.metadata.update(classification)
+                        # 添加文件级别的hash到每个chunk
+                        doc.metadata['file_hash'] = new_content_hash
 
                     all_documents.extend(documents)
                     processed_files.append(file_name)
+                    
+                    # 清除成功的检查点
+                    recovery_manager.clear_checkpoint()
 
+                except PermissionError as e:
+                    logger.error(f"文件权限错误 {file_path}: {str(e)}")
+                    failed_files.append((Path(file_path).name, "权限不足"))
+                    continue
+                except IOError as e:
+                    logger.error(f"文件IO错误 {file_path}: {str(e)}")
+                    failed_files.append((Path(file_path).name, f"IO错误: {str(e)}"))
+                    continue
                 except Exception as e:
                     logger.warning(f"文件处理失败 {file_path}: {str(e)}")
+                    failed_files.append((Path(file_path).name, str(e)))
                     continue
 
             # 添加到向量存储
@@ -158,6 +251,11 @@ class KnowledgeManagerApp:
                         for fname in skipped_files:
                             result += f"  • {fname}\n"
                     
+                    if failed_files:
+                        result += f"\n❌ **失败文件**: {len(failed_files)} 个\n"
+                        for fname, reason in failed_files:
+                            result += f"  • {fname}: {reason}\n"
+                    
                     result += f"\n📊 **文档分类统计**：\n"
 
                     # 统计分类信息
@@ -183,13 +281,30 @@ class KnowledgeManagerApp:
                     return result
                 else:
                     return "❌ 文件处理失败，请重试。"
-            elif skipped_files:
-                return f"⏭️ 已跳过 {len(skipped_files)} 个文件（内容未变化，无需重新处理）\n" + "\n".join(f"  • {f}" for f in skipped_files)
+            elif skipped_files or failed_files:
+                # 只有跳过和失败的情况
+                result = ""
+                if skipped_files:
+                    result += f"⏭️ **跳过文件**: {len(skipped_files)} 个（内容未变化）\n"
+                    for fname in skipped_files:
+                        result += f"  • {fname}\n"
+                if failed_files:
+                    if skipped_files:
+                        result += "\n"
+                    result += f"❌ **失败文件**: {len(failed_files)} 个\n"
+                    for fname, reason in failed_files:
+                        result += f"  • {fname}: {reason}\n"
+                return result if result else "⚠️ 没有成功处理任何文件。"
             else:
                 return "⚠️ 没有成功处理任何文件。"
 
         except Exception as e:
             logger.error(f"文件处理异常: {str(e)}")
+            # 尝试恢复上次的检查点
+            checkpoint = recovery_manager.load_last_checkpoint()
+            if checkpoint:
+                logger.info(f"检测到检查点: {checkpoint}")
+                return f"❌ 处理失败: {str(e)}\n💡 上次处理到: {checkpoint.get('file_name', '未知')} - {checkpoint.get('stage', '未知阶段')}"
             return f"❌ 处理失败: {str(e)}"
 
     def chat_with_knowledge(self, message: str, history: List[Dict[str, str]]) -> str:
@@ -318,6 +433,14 @@ class KnowledgeManagerApp:
             else:
                 documents = self.vector_store.search(query, k=top_k)
                 logger.info(f"[搜索] 语义检索完成，找到{len(documents)}个结果")
+
+            # 记录搜索历史
+            self.search_history_manager.add_search(
+                query=query,
+                mode=mode,
+                top_k=top_k,
+                results_count=len(documents)
+            )
 
             if not documents:
                 return f"❌ 未找到与 '{query}' 相关的文档。\n\n💡 提示：请确保已上传文档到知识库。"
@@ -654,10 +777,18 @@ class KnowledgeManagerApp:
                 # Tab 3: 搜索功能
                 with gr.TabItem("🔍 文档搜索"):
                     with gr.Row():
-                        search_input = gr.Textbox(
-                            label="搜索关键词",
-                            placeholder="输入关键词进行搜索..."
-                        )
+                        with gr.Column(scale=3):
+                            search_input = gr.Textbox(
+                                label="搜索关键词",
+                                placeholder="输入关键词进行搜索..."
+                            )
+                        with gr.Column(scale=1):
+                            history_dropdown = gr.Dropdown(
+                                label="📝 搜索历史",
+                                choices=[],
+                                interactive=True,
+                                allow_custom_value=False
+                            )
 
                     with gr.Row():
                         search_mode = gr.Dropdown(
@@ -675,7 +806,10 @@ class KnowledgeManagerApp:
                             elem_id="top_k_slider"
                         )
 
-                    search_btn = gr.Button("🔍 搜索", variant="primary")
+                    with gr.Row():
+                        search_btn = gr.Button("🔍 搜索", variant="primary")
+                        refresh_history_btn = gr.Button("🔄 刷新历史")
+                        clear_history_btn = gr.Button("🗑️ 清空历史")
 
                     search_results = gr.Textbox(
                         label="搜索结果",
@@ -683,10 +817,42 @@ class KnowledgeManagerApp:
                         max_lines=20
                     )
 
+                    # 搜索历史显示
+                    with gr.Accordion("📋 搜索历史记录", open=False):
+                        history_display = gr.Markdown(value="暂无搜索历史")
+
+                    # 定义辅助函数
+                    def refresh_history_dropdown():
+                        """刷新历史下拉菜单"""
+                        choices = self.search_history_manager.get_history_dropdown_choices(20)
+                        return gr.Dropdown(choices=choices)
+
+                    def refresh_history_display():
+                        """刷新历史显示"""
+                        return self.search_history_manager.format_history_for_display(15)
+
+                    def clear_search_history():
+                        """清空搜索历史"""
+                        self.search_history_manager.clear_history()
+                        return gr.Dropdown(choices=[]), "✅ 搜索历史已清空"
+
+                    def use_history_query(selected_query):
+                        """使用历史查询"""
+                        if selected_query:
+                            return selected_query
+                        return ""
+
+                    # 绑定事件
                     search_btn.click(
                         self.search_knowledge,
                         inputs=[search_input, search_mode, top_k_slider],
                         outputs=[search_results]
+                    ).then(
+                        refresh_history_dropdown,
+                        outputs=[history_dropdown]
+                    ).then(
+                        refresh_history_display,
+                        outputs=[history_display]
                     )
                     
                     # 支持Enter键搜索
@@ -694,6 +860,37 @@ class KnowledgeManagerApp:
                         self.search_knowledge,
                         inputs=[search_input, search_mode, top_k_slider],
                         outputs=[search_results]
+                    ).then(
+                        refresh_history_dropdown,
+                        outputs=[history_dropdown]
+                    ).then(
+                        refresh_history_display,
+                        outputs=[history_display]
+                    )
+
+                    # 点击历史记录填充到搜索框
+                    history_dropdown.change(
+                        use_history_query,
+                        inputs=[history_dropdown],
+                        outputs=[search_input]
+                    )
+
+                    # 刷新历史按钮
+                    refresh_history_btn.click(
+                        refresh_history_dropdown,
+                        outputs=[history_dropdown]
+                    ).then(
+                        refresh_history_display,
+                        outputs=[history_display]
+                    )
+
+                    # 清空历史按钮
+                    clear_history_btn.click(
+                        clear_search_history,
+                        outputs=[history_dropdown, search_results]
+                    ).then(
+                        refresh_history_display,
+                        outputs=[history_display]
                     )
 
                 # Tab 4: 统计信息
