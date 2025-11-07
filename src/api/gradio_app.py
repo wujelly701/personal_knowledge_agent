@@ -60,12 +60,13 @@ class KnowledgeManagerApp:
 
         logger.info("知识管理应用初始化完成")
 
-    def load_and_process_files(self, files: List[str]) -> str:
+    def load_and_process_files(self, files: List[str], progress=gr.Progress()) -> str:
         """
         加载和处理上传的文件
 
         Args:
             files: 上传的文件路径列表
+            progress: Gradio进度跟踪器
 
         Returns:
             处理结果消息
@@ -87,6 +88,7 @@ class KnowledgeManagerApp:
             SUPPORTED_EXTENSIONS = {'.txt', '.md', '.pdf', '.doc', '.docx'}
 
             logger.info(f"开始处理 {len(files)} 个文件")
+            progress(0, desc="开始处理文件...")
 
             # 批量处理文件
             all_documents = []
@@ -95,10 +97,14 @@ class KnowledgeManagerApp:
             updated_files = []
             failed_files = []
             
-            for file_path in files:
+            total_files = len(files)
+            for idx, file_path in enumerate(files):
                 try:
-                    # 获取文件名
+                    # 更新进度
+                    current_progress = idx / total_files
                     file_name = Path(file_path).name
+                    progress(current_progress, desc=f"处理文件 {idx+1}/{total_files}: {file_name}")
+                    
                     # 保存哈希值变量
                     new_content_hash = None
                     
@@ -197,9 +203,14 @@ class KnowledgeManagerApp:
                         'stage': 'loading_document'
                     })
                     
+                    progress(current_progress + 0.3/total_files, desc=f"加载文档: {file_name}")
                     documents = self.document_loader.load_file(file_path)
 
                     # 为每个文档添加分类信息和文件哈希
+                    progress(current_progress + 0.5/total_files, desc=f"分类文档: {file_name}")
+                    import time
+                    upload_timestamp = time.time()  # 获取上传时间戳
+                    
                     for doc in documents:
                         classification = self.document_classifier.classify_document(doc)
                         # 清理None值（ChromaDB不接受None类型的metadata）
@@ -207,6 +218,8 @@ class KnowledgeManagerApp:
                         doc.metadata.update(classification)
                         # 添加文件级别的hash到每个chunk
                         doc.metadata['file_hash'] = new_content_hash
+                        # 添加上传时间戳
+                        doc.metadata['upload_time'] = upload_timestamp
 
                     all_documents.extend(documents)
                     processed_files.append(file_name)
@@ -229,8 +242,10 @@ class KnowledgeManagerApp:
 
             # 添加到向量存储
             if all_documents:
+                progress(0.9, desc=f"生成Embedding ({len(all_documents)} 个文档块)...")
                 success = self.vector_store.add_documents(all_documents)
                 if success:
+                    progress(1.0, desc="处理完成!")
                     result = f"✅ 成功处理 {len(all_documents)} 个文档块\n\n"
                     
                     # 显示处理统计
@@ -408,7 +423,7 @@ class KnowledgeManagerApp:
             logger.error(f"对话生成失败: {str(e)}")
             return f"抱歉，回答生成过程中出现错误：{str(e)}"
 
-    def search_knowledge(self, query: str, mode: str = "混合检索", top_k: int = 5) -> str:
+    def search_knowledge(self, query: str, mode: str = "混合检索", top_k: int = 5, progress=gr.Progress()) -> str:
         """
         搜索知识库
 
@@ -416,6 +431,7 @@ class KnowledgeManagerApp:
             query: 搜索查询
             mode: 搜索模式
             top_k: 返回结果数量
+            progress: Gradio进度跟踪器
 
         Returns:
             搜索结果
@@ -425,15 +441,19 @@ class KnowledgeManagerApp:
                 return "⚠️ 请输入搜索关键词。"
 
             logger.info(f"[搜索] 开始搜索: query='{query}', mode='{mode}', top_k={top_k}")
+            progress(0, desc="正在搜索...")
 
             # 根据模式选择检索方法
             if mode == "混合检索":
+                progress(0.3, desc="执行混合检索...")
                 documents = self.hybrid_retriever.hybrid_search(query, k=top_k)
                 logger.info(f"[搜索] 混合检索完成，找到{len(documents)}个结果")
             else:
+                progress(0.3, desc="执行语义检索...")
                 documents = self.vector_store.search(query, k=top_k)
                 logger.info(f"[搜索] 语义检索完成，找到{len(documents)}个结果")
 
+            progress(0.7, desc="记录搜索历史...")
             # 记录搜索历史
             self.search_history_manager.add_search(
                 query=query,
@@ -443,8 +463,10 @@ class KnowledgeManagerApp:
             )
 
             if not documents:
+                progress(1.0, desc="搜索完成")
                 return f"❌ 未找到与 '{query}' 相关的文档。\n\n💡 提示：请确保已上传文档到知识库。"
 
+            progress(0.9, desc="格式化结果...")
             # 构建搜索结果
             result = f"🔍 **搜索结果** (共找到 {len(documents)} 个相关文档块):\n\n"
 
@@ -465,6 +487,7 @@ class KnowledgeManagerApp:
 
             result += f"\n💡 *搜索模式: {mode} | 返回{len(documents)}个结果*"
 
+            progress(1.0, desc="搜索完成!")
             logger.info(f"[搜索] 返回格式化结果，长度={len(result)}")
             return result
 
@@ -477,28 +500,59 @@ class KnowledgeManagerApp:
         获取所有文档列表
         
         Returns:
-            文档列表 [[filename, chunks, category, file_type], ...]
+            文档列表 [[filename, chunks, category, file_type, file_size, last_updated], ...]
         """
         try:
-            # 从collection获取所有metadata
-            all_docs = self.vector_store.collection.get()
+            from datetime import datetime
+            import time
+            
+            # 从collection获取所有metadata和IDs
+            all_docs = self.vector_store.collection.get(include=['metadatas'])
             
             # 按文件名分组统计
             file_stats = {}
-            for metadata in all_docs['metadatas']:
+            for i, metadata in enumerate(all_docs['metadatas']):
                 filename = metadata.get('filename', '未知')
                 if filename not in file_stats:
+                    # 获取上传时间，如果不存在则使用None标记为旧文档
+                    upload_time = metadata.get('upload_time')
+                    
                     file_stats[filename] = {
                         'filename': filename,
                         'chunks': 0,
                         'category': metadata.get('category', '未分类'),
-                        'file_type': metadata.get('file_type', '未知')
+                        'file_type': metadata.get('file_type', '未知'),
+                        'file_size': metadata.get('file_size', 0),
+                        'upload_time': upload_time  # 从metadata读取，可能为None
                     }
                 file_stats[filename]['chunks'] += 1
             
             # 转换为列表格式
-            result = [[f['filename'], f['chunks'], f['category'], f['file_type']] 
-                     for f in file_stats.values()]
+            result = []
+            for f in file_stats.values():
+                # 格式化文件大小
+                size_mb = f['file_size']
+                if size_mb < 0.01:
+                    size_str = f"{size_mb * 1024:.1f} KB"
+                else:
+                    size_str = f"{size_mb:.2f} MB"
+                
+                # 格式化上传时间
+                if f['upload_time'] is not None:
+                    # 有时间戳，格式化显示
+                    last_updated = datetime.fromtimestamp(f['upload_time']).strftime('%Y-%m-%d %H:%M')
+                else:
+                    # 旧文档，显示"未记录"
+                    last_updated = "未记录"
+                
+                result.append([
+                    f['filename'], 
+                    f['chunks'], 
+                    f['category'], 
+                    f['file_type'],
+                    size_str,
+                    last_updated
+                ])
             
             logger.info(f"获取文档列表成功，共{len(result)}个文件")
             return result
@@ -506,6 +560,75 @@ class KnowledgeManagerApp:
         except Exception as e:
             logger.error(f"获取文档列表失败: {str(e)}")
             return []
+    
+    def preview_document(self, filename: str, preview_chunks: int = 3) -> str:
+        """
+        预览文档内容
+        
+        Args:
+            filename: 文件名
+            preview_chunks: 预览的chunk数量（默认3个）
+            
+        Returns:
+            预览内容（Markdown格式）
+        """
+        try:
+            if not filename or not filename.strip():
+                return "⚠️ 请输入要预览的文件名"
+            
+            logger.info(f"预览文档: {filename}")
+            
+            # 获取该文件的所有chunks
+            all_docs = self.vector_store.collection.get(
+                where={"filename": filename},
+                include=['metadatas', 'documents']
+            )
+            
+            if not all_docs['ids']:
+                return f"⚠️ 未找到文件: {filename}"
+            
+            # 按chunk_id排序
+            chunks_data = list(zip(
+                all_docs['metadatas'],
+                all_docs['documents']
+            ))
+            chunks_data.sort(key=lambda x: x[0].get('chunk_id', 0))
+            
+            # 构建预览内容
+            total_chunks = len(chunks_data)
+            preview_count = min(preview_chunks, total_chunks)
+            
+            result = f"# 📄 文档预览: {filename}\n\n"
+            result += f"**总块数**: {total_chunks} | **预览块数**: {preview_count}\n\n"
+            result += "---\n\n"
+            
+            for i in range(preview_count):
+                metadata, content = chunks_data[i]
+                chunk_id = metadata.get('chunk_id', i)
+                result += f"### 📌 Chunk {chunk_id + 1}/{total_chunks}\n\n"
+                
+                # 显示metadata信息
+                category = metadata.get('category', '未分类')
+                file_type = metadata.get('file_type', '未知')
+                result += f"**分类**: {category} | **类型**: {file_type}\n\n"
+                
+                # 显示内容（限制长度）
+                preview_text = content[:500] if len(content) > 500 else content
+                if len(content) > 500:
+                    preview_text += "\n\n*（内容过长，已截断...）*"
+                
+                result += f"```\n{preview_text}\n```\n\n"
+                result += "---\n\n"
+            
+            if total_chunks > preview_count:
+                result += f"\n💡 *还有 {total_chunks - preview_count} 个chunk未显示*"
+            
+            logger.info(f"文档预览成功: {filename}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"文档预览失败: {str(e)}")
+            return f"❌ 预览失败: {str(e)}"
     
     def delete_document_by_filename(self, filename: str) -> str:
         """
@@ -925,7 +1048,7 @@ class KnowledgeManagerApp:
                     
                     # 文档列表展示
                     file_list_display = gr.Dataframe(
-                        headers=["文件名", "分块数", "分类", "类型"],
+                        headers=["文件名", "分块数", "分类", "类型", "文件大小", "最后更新"],
                         label="知识库文档列表",
                         interactive=False,
                         wrap=True
@@ -978,17 +1101,46 @@ class KnowledgeManagerApp:
                         max_lines=10
                     )
                     
+                    gr.Markdown("---")
+                    
+                    # 文档预览功能
+                    gr.Markdown("### 👀 文档预览")
+                    
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            preview_filename_input = gr.Textbox(
+                                label="📝 要预览的文件名",
+                                placeholder="输入完整的文件名（如：python_learning_notes.md）",
+                                info="请从上方列表中复制文件名"
+                            )
+                        with gr.Column(scale=1):
+                            preview_chunks_slider = gr.Slider(
+                                minimum=1,
+                                maximum=10,
+                                value=3,
+                                step=1,
+                                label="预览块数",
+                                info="选择要预览的chunk数量"
+                            )
+                        with gr.Column(scale=1):
+                            preview_btn = gr.Button("👀 预览文档", variant="primary")
+                    
+                    preview_display = gr.Markdown(
+                        label="文档预览",
+                        value="点击'预览文档'按钮查看文档内容"
+                    )
+                    
                     # 绑定事件处理器
                     def refresh_file_list():
                         """刷新文件列表并返回格式化的数据"""
                         try:
                             file_list = self.get_document_list()
                             # get_document_list() 已经返回列表格式，直接返回即可
-                            return file_list if file_list else [["暂无文档", "0", "-", "-"]]
+                            return file_list if file_list else [["暂无文档", "0", "-", "-", "-", "-"]]
                         
                         except Exception as e:
                             logger.error(f"刷新文件列表失败: {str(e)}")
-                            return [["错误", str(e), "-", "-"]]
+                            return [["错误", str(e), "-", "-", "-", "-"]]
                     
                     def select_file_from_list(evt: gr.SelectData):
                         """从列表中选择文件，自动填充文件名"""
@@ -999,8 +1151,8 @@ class KnowledgeManagerApp:
                             file_list = self.get_document_list()
                             if row < len(file_list):
                                 filename = file_list[row][0]  # 第一列是文件名
-                                return filename, filename
-                        return "", ""
+                                return filename, filename, filename
+                        return "", "", ""
                     
                     # 绑定按钮事件
                     refresh_list_btn.click(
@@ -1011,7 +1163,7 @@ class KnowledgeManagerApp:
                     # 点击表格自动填充文件名
                     file_list_display.select(
                         select_file_from_list,
-                        outputs=[delete_filename_input, update_filename_input]
+                        outputs=[delete_filename_input, update_filename_input, preview_filename_input]
                     )
                     
                     delete_btn.click(
@@ -1036,6 +1188,13 @@ class KnowledgeManagerApp:
                     ).then(
                         lambda: ("", None),  # 更新后清空输入框和文件选择器
                         outputs=[update_filename_input, update_file_input]
+                    )
+                    
+                    # 绑定预览事件
+                    preview_btn.click(
+                        self.preview_document,
+                        inputs=[preview_filename_input, preview_chunks_slider],
+                        outputs=[preview_display]
                     )
 
             # 页脚
