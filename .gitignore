@@ -54,6 +54,9 @@ Thumbs.db
 *.bak
 console.log
 
+# Docker override (保留.dockerignore)
+docker-compose.override.yml
+
 # 测试和示例文件
 demo.py
 quick_check.py

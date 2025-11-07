@@ -1,0 +1,62 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+venv/
+env/
+ENV/
+
+# 数据和日志
+data/
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试文件
+demo.py
+quick_check.py
+simple_start.py
+test_*.py
+verify_updates.py
+
+# 文档（保留必要的）
+DOCKER_DEPLOYMENT.md
+开发文档.md
+构建个人知识管理Agent系统*.md
+report-*.md
+traceability-*.md
+PATCHES.md
+EMBEDDING_CONFIG.md
+FREE_EMBEDDING_GUIDE.md
+FIXPLAN.md
+GIT_COMMIT_GUIDE.md
+TASK_COMPLETION_REPORT.md
+RELEASE_NOTES_*.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 其他
+*.bak
+*.tmp
+console.log
