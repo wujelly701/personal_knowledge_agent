@@ -883,6 +883,55 @@ class KnowledgeManagerApp:
         except Exception as e:
             logger.error(f"文档更新失败: {str(e)}", exc_info=True)
             return f"❌ 更新失败: {str(e)}"
+    
+    def update_document_tags(self, filename: str, new_tags: str) -> str:
+        """
+        更新文档标签
+        
+        Args:
+            filename: 文件名
+            new_tags: 新标签（逗号分隔）
+            
+        Returns:
+            更新结果消息
+        """
+        try:
+            if not filename or not filename.strip():
+                return "⚠️ 请输入文件名"
+            
+            if new_tags is None:
+                new_tags = ""
+            
+            new_tags = new_tags.strip()
+            
+            logger.info(f"更新文档标签: {filename} -> {new_tags}")
+            
+            # 获取该文件的所有文档块
+            all_docs = self.vector_store.collection.get(
+                where={"filename": filename},
+                include=['metadatas']
+            )
+            
+            if not all_docs['ids']:
+                logger.warning(f"文档未找到: {filename}")
+                return f"⚠️ 未找到文件: {filename}\n\n💡 提示：请检查文件名是否正确（区分大小写）"
+            
+            # 更新每个块的tags字段
+            updated_count = 0
+            for doc_id, metadata in zip(all_docs['ids'], all_docs['metadatas']):
+                metadata['tags'] = new_tags
+                self.vector_store.collection.update(
+                    ids=[doc_id],
+                    metadatas=[metadata]
+                )
+                updated_count += 1
+            
+            logger.info(f"标签更新成功: {filename}, 更新了{updated_count}个文档块")
+            return f"✅ 已更新 **{filename}** 的标签\n\n新标签: {new_tags if new_tags else '(无)'}\n更新块数: {updated_count}"
+            
+        except Exception as e:
+            logger.error(f"标签更新失败: {str(e)}", exc_info=True)
+            return f"❌ 更新失败: {str(e)}"
 
     def get_statistics(self) -> str:
         """
@@ -1261,6 +1310,38 @@ class KnowledgeManagerApp:
                     
                     gr.Markdown("---")
                     
+                    # 编辑标签功能
+                    gr.Markdown("### ✏️ 编辑文档标签")
+                    gr.Markdown(
+                        """
+                        💡 **提示**: 修改文档标签，用逗号分隔多个标签（如：Python, 机器学习, 教程）
+                        """
+                    )
+                    
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            edit_tags_filename_input = gr.Textbox(
+                                label="📝 文件名",
+                                placeholder="输入要编辑标签的文件名（如：python_learning_notes.md）",
+                                info="请从上方列表中复制文件名"
+                            )
+                        with gr.Column(scale=3):
+                            edit_tags_input = gr.Textbox(
+                                label="🏷️ 新标签",
+                                placeholder="输入新标签，用逗号分隔（如：Python, 机器学习, 教程）",
+                                info="留空表示清除所有标签"
+                            )
+                        with gr.Column(scale=1):
+                            edit_tags_btn = gr.Button("✏️ 更新标签", variant="primary")
+                    
+                    edit_tags_status = gr.Textbox(
+                        label="编辑状态",
+                        lines=3,
+                        max_lines=5
+                    )
+                    
+                    gr.Markdown("---")
+                    
                     # 更新文档功能
                     gr.Markdown("### 🔄 更新文档")
                     
@@ -1337,8 +1418,8 @@ class KnowledgeManagerApp:
                             file_list = self.get_document_list()
                             if row < len(file_list):
                                 filename = file_list[row][0]  # 第一列是文件名
-                                return filename, filename, filename
-                        return "", "", ""
+                                return filename, filename, filename, filename  # 同时填充删除、更新、预览、编辑标签的输入框
+                        return "", "", "", ""
                     
                     # 绑定按钮事件
                     refresh_list_btn.click(
@@ -1349,7 +1430,7 @@ class KnowledgeManagerApp:
                     # 点击表格自动填充文件名
                     file_list_display.select(
                         select_file_from_list,
-                        outputs=[delete_filename_input, update_filename_input, preview_filename_input]
+                        outputs=[delete_filename_input, update_filename_input, preview_filename_input, edit_tags_filename_input]
                     )
                     
                     delete_btn.click(
@@ -1362,6 +1443,19 @@ class KnowledgeManagerApp:
                     ).then(
                         lambda: "",  # 删除后清空输入框
                         outputs=[delete_filename_input]
+                    )
+                    
+                    # 编辑标签事件
+                    edit_tags_btn.click(
+                        self.update_document_tags,
+                        inputs=[edit_tags_filename_input, edit_tags_input],
+                        outputs=[edit_tags_status]
+                    ).then(
+                        refresh_file_list,  # 编辑后自动刷新列表
+                        outputs=[file_list_display]
+                    ).then(
+                        lambda: ("", ""),  # 编辑后清空输入框
+                        outputs=[edit_tags_filename_input, edit_tags_input]
                     )
                     
                     update_btn.click(
