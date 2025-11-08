@@ -653,10 +653,10 @@ class KnowledgeManagerApp:
                         relevance_reasons.append("语义部分相关")
                 
                 if relevance_reasons:
-                    result += f" ({', '.join(relevance_reasons)})"
+                    result += f" - {', '.join(relevance_reasons)}"
                 result += "\n"
                 
-                result += f"   📝 内容预览: {content_preview}\n\n"
+                result += f"   📝内容预览：\n {content_preview}\n\n"
 
             result += f"\n💡 *搜索模式: {mode} | 返回{len(documents)}个结果*"
 
