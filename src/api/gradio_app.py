@@ -25,9 +25,7 @@ class KnowledgeManagerApp:
     def __init__(self):
         # 初始化组件
         self.document_loader = DocumentLoader()
-        self.document_classifier = DocumentClassifier()
-        self.vector_store = VectorStore()
-        self.hybrid_retriever = HybridRetriever(self.vector_store)
+        
         # 智能初始化LLM组件
         self.llm_manager = None
         self.rag_generator = None
@@ -46,6 +44,13 @@ class KnowledgeManagerApp:
                 logger.info("ℹ️ DeepSeek API未配置，使用简化回答模式")
         except Exception as e:
             logger.warning(f"LLM功能初始化失败，将使用简化模式: {e}")
+        
+        # 初始化文档分类器（传入LLM管理器以启用智能分类）
+        self.document_classifier = DocumentClassifier(llm_manager=self.llm_manager)
+        
+        # 初始化其他组件
+        self.vector_store = VectorStore()
+        self.hybrid_retriever = HybridRetriever(self.vector_store)
 
         # 搜索历史管理器
         self.search_history_manager = SearchHistoryManager()
@@ -696,7 +701,8 @@ class KnowledgeManagerApp:
                         'category': metadata.get('category', '未分类'),
                         'file_type': metadata.get('file_type', '未知'),
                         'file_size': metadata.get('file_size', 0),
-                        'upload_time': upload_time  # 从metadata读取，可能为None
+                        'upload_time': upload_time,  # 从metadata读取，可能为None
+                        'tags': metadata.get('tags', '')  # 获取标签
                     }
                 file_stats[filename]['chunks'] += 1
             
@@ -718,13 +724,19 @@ class KnowledgeManagerApp:
                     # 旧文档，显示"未记录"
                     last_updated = "未记录"
                 
+                # 格式化标签（限制显示长度）
+                tags = f.get('tags', '')
+                if tags and len(tags) > 30:
+                    tags = tags[:30] + "..."
+                
                 result.append([
                     f['filename'], 
                     f['chunks'], 
                     f['category'], 
                     f['file_type'],
                     size_str,
-                    last_updated
+                    last_updated,
+                    tags  # 添加标签列
                 ])
             
             logger.info(f"获取文档列表成功，共{len(result)}个文件")
@@ -1221,7 +1233,7 @@ class KnowledgeManagerApp:
                     
                     # 文档列表展示
                     file_list_display = gr.Dataframe(
-                        headers=["文件名", "分块数", "分类", "类型", "文件大小", "最后更新"],
+                        headers=["文件名", "分块数", "分类", "类型", "文件大小", "最后更新", "标签"],
                         label="知识库文档列表",
                         interactive=False,
                         wrap=True
