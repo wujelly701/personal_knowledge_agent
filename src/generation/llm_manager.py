@@ -233,14 +233,15 @@ class RAGGenerator:
 - confidence: 置信度（0-1）"""
     
     def generate_answer(self, query: str, documents: List[LangChainDocument], 
-                       include_sources: bool = True) -> Dict[str, Any]:
+                       include_sources: bool = True, conversation_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """
-        基于检索文档生成回答（带重试机制）
+        基于检索文档生成回答（带重试机制和对话上下文）
         
         Args:
             query: 用户问题
             documents: 检索到的相关文档
             include_sources: 是否包含来源引用
+            conversation_history: 对话历史 [{'role': 'user'|'assistant', 'content': str}, ...]
             
         Returns:
             生成的回答信息
@@ -261,14 +262,24 @@ class RAGGenerator:
                 # 构建上下文
                 context = self._build_context(documents, include_sources)
                 
-                # 生成回答
+                # 构建消息列表（包含对话历史）
                 messages = [
                     SystemMessage(content=self.rag_system_prompt.format(
                         context=context,
                         question=query
-                    )),
-                    HumanMessage(content="请基于上述上下文回答问题。")
+                    ))
                 ]
+                
+                # 添加对话历史（如果有）
+                if conversation_history:
+                    for msg in conversation_history[-10:]:  # 只保留最近10条
+                        if msg['role'] == 'user':
+                            messages.append(HumanMessage(content=msg['content']))
+                        elif msg['role'] == 'assistant':
+                            messages.append(AIMessage(content=msg['content']))
+                
+                # 添加当前问题
+                messages.append(HumanMessage(content="请基于上述上下文回答问题。"))
                 
                 response = self.chat_model.invoke(messages)
                 answer = response.content if hasattr(response, 'content') else str(response)
@@ -276,20 +287,31 @@ class RAGGenerator:
                 # 提取置信度
                 confidence = self._estimate_confidence(query, documents, answer)
                 
-                # 构建结果
+                # 构建结果（添加chunk_id和content到sources）
+                sources_with_details = []
+                for doc in documents[:3]:
+                    source_info = {
+                        'filename': doc.metadata.get('filename', '未知'),
+                        'relevance_score': doc.metadata.get('relevance_score', 0.0),
+                        'chunk_id': doc.metadata.get('chunk_id', 0) + 1,  # 从1开始编号
+                        'content': doc.page_content[:200]  # 保存前200字符用于引用
+                    }
+                    sources_with_details.append(source_info)
+                
                 result = {
                     "answer": answer,
                     "confidence": confidence,
-                    "sources": self._extract_sources(documents),
+                    "sources": sources_with_details,
                     "metadata": {
                         "query": query,
                         "retrieved_docs": len(documents),
                         "model_used": settings.LLM_MODEL,
-                        "tokens_used": getattr(response, 'usage_metadata', {}).get('total_tokens', 0) if hasattr(response, 'usage_metadata') else 0
+                        "tokens_used": getattr(response, 'usage_metadata', {}).get('total_tokens', 0) if hasattr(response, 'usage_metadata') else 0,
+                        "has_context": bool(conversation_history)
                     }
                 }
                 
-                logger.info(f"RAG回答生成成功: 查询='{query[:30]}...', 置信度={confidence:.2f}")
+                logger.info(f"RAG回答生成成功: 查询='{query[:30]}...', 置信度={confidence:.2f}, 上下文={len(conversation_history) if conversation_history else 0}条")
                 return result
                 
             except Exception as e:

@@ -8,6 +8,7 @@ import logging
 import gradio as gr
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from config.settings import settings
 from src.ingestion.document_loader_simple import DocumentLoader, DocumentClassifier
@@ -17,8 +18,6 @@ from src.utils.search_history import SearchHistoryManager
 
 # 获取日志器（日志已在main.py中统一配置）
 logger = logging.getLogger(__name__)
-
-
 
 class KnowledgeManagerApp:
     """知识管理应用主类"""
@@ -337,10 +336,28 @@ class KnowledgeManagerApp:
             if not message.strip():
                 return "请输入您的问题。"
 
-            logger.info(f"收到用户问题: {message[:50]}...")
+            logger.info(f"收到用户问题: {message[:50]}..., 历史轮数: {len(history)//2 if history else 0}")
+
+            # 构建上下文查询（结合最近3轮对话）
+            context_query = message
+            if history and len(history) >= 2:
+                # 获取最近3轮对话（6条消息）
+                recent_history = history[-6:] if len(history) > 6 else history
+                context_parts = []
+                for msg in recent_history:
+                    if msg['role'] == 'user':
+                        context_parts.append(f"用户: {msg['content']}")
+                    elif msg['role'] == 'assistant':
+                        # 只保留简短摘要，不包含完整回答
+                        content = msg['content'][:100] if len(msg['content']) > 100 else msg['content']
+                        context_parts.append(f"助手: {content}")
+                
+                # 组合查询（当前问题 + 上下文）
+                context_query = f"{' '.join(context_parts[-2:])} {message}"
+                logger.info(f"使用上下文查询: {context_query[:100]}...")
 
             # 检索相关文档
-            retrieved_docs = self.vector_store.search(message, k=settings.TOP_K)
+            retrieved_docs = self.vector_store.search(context_query, k=settings.TOP_K)
 
             if not retrieved_docs:
                 return "我在知识库中没有找到相关信息。请尝试：\n1. 检查问题表述\n2. 上传相关文档\n3. 使用不同的关键词"
@@ -348,11 +365,23 @@ class KnowledgeManagerApp:
             # 如果LLM功能可用且有DeepSeek API，使用RAG生成器
             if self.llm_enabled and self.rag_generator:
                 try:
-                    # 使用RAG生成器生成智能回答
+                    # 构建对话历史（传递给LLM）
+                    conversation_context = []
+                    if history:
+                        # 只保留最近5轮对话
+                        recent = history[-10:] if len(history) > 10 else history
+                        for msg in recent:
+                            conversation_context.append({
+                                'role': msg['role'],
+                                'content': msg['content'][:500]  # 限制长度
+                            })
+                    
+                    # 使用RAG生成器生成智能回答（传递对话历史）
                     result = self.rag_generator.generate_answer(
                         query=message,
                         documents=retrieved_docs,
-                        include_sources=True
+                        include_sources=True,
+                        conversation_history=conversation_context  # 传递上下文
                     )
 
                     # 构建回答
@@ -365,23 +394,42 @@ class KnowledgeManagerApp:
                         confidence_level = "高" if result['confidence'] > 0.8 else "中" if result['confidence'] > 0.5 else "低"
                         answer_parts.append(f"\n📊 置信度：{confidence_level} ({result['confidence']:.2f})")
 
-                    # 添加来源信息
+                    # 添加来源信息（带引用编号）
                     if result['sources']:
-                        answer_parts.append("\n📚 **信息来源：**\n")
+                        answer_parts.append("\n\n📚 **引用来源：**\n")
                         for i, source in enumerate(result['sources'][:3], 1):
-                            answer_parts.append(f"{i}. {source['filename']} (相关性: {source['relevance_score']:.2f})\n")
+                            filename = source['filename']
+                            relevance = source['relevance_score']
+                            chunk_id = source.get('chunk_id', '?')
+                            # 添加可点击的引用格式
+                            answer_parts.append(f"[{i}] 📄 **{filename}** (chunk {chunk_id}, 相关性: {relevance:.2f})\n")
+                            # 显示引用内容片段
+                            if 'content' in source:
+                                preview = source['content'][:150] if len(source['content']) > 150 else source['content']
+                                answer_parts.append(f"   _{preview}..._\n\n")
 
                     # 添加token使用量
                     if result['metadata']['tokens_used']:
-                        answer_parts.append(f"\n token使用量：{result['metadata']['tokens_used']} ")
+                        answer_parts.append(f"\n💬 Token使用量：{result['metadata']['tokens_used']}")
+                    
+                    # 生成相关问题推荐
+                    try:
+                        suggested_questions = self._generate_suggested_questions(message, result['answer'], retrieved_docs)
+                        if suggested_questions:
+                            answer_parts.append("\n\n💡 **您可能还想了解：**\n")
+                            for i, q in enumerate(suggested_questions, 1):
+                                answer_parts.append(f"{i}. {q}\n")
+                    except Exception as sq_error:
+                        logger.warning(f"推荐问题生成失败: {sq_error}")
 
                     answer = "".join(answer_parts)
 
-                    logger.info(f"AI 回答生成完成: 查询='{message[:30]}...', 置信度={result['confidence']:.2f}")
+                    logger.info(f"AI 回答生成完成: 查询='{message[:30]}...', 置信度={result['confidence']:.2f}, 使用上下文={len(conversation_context)}条")
                     return answer
 
                 except Exception as e:
                     logger.warning(f"RAG生成失败，回退到简化模式: {e}")
+                    # 回退到简化模式
                     # 回退到简化模式
 
             # 简化模式回答（不依赖LLM）
@@ -422,6 +470,90 @@ class KnowledgeManagerApp:
         except Exception as e:
             logger.error(f"对话生成失败: {str(e)}")
             return f"抱歉，回答生成过程中出现错误：{str(e)}"
+    
+    def _generate_suggested_questions(self, original_query: str, answer: str, documents: List) -> List[str]:
+        """
+        基于当前问题和答案生成相关问题推荐
+        
+        Args:
+            original_query: 原始问题
+            answer: AI回答
+            documents: 检索到的文档
+            
+        Returns:
+            推荐问题列表（3-5个）
+        """
+        try:
+            if not self.llm_enabled or not self.llm_manager:
+                # 没有LLM，使用简单的基于关键词的推荐
+                return self._generate_simple_suggestions(documents)
+            
+            # 使用LLM生成推荐问题
+            prompt = f"""基于以下对话，生成3-5个用户可能感兴趣的后续问题。
+
+原始问题: {original_query}
+回答: {answer[:300]}...
+
+请生成简洁、具体的后续问题，每行一个问题，不要编号。直接输出问题即可。"""
+            
+            messages = [
+                SystemMessage(content="你是一个助手，帮助用户发现相关问题。"),
+                HumanMessage(content=prompt)
+            ]
+            
+            response = self.llm_manager.chat_model.invoke(messages)
+            suggestions_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # 解析建议问题
+            suggestions = []
+            for line in suggestions_text.strip().split('\n'):
+                line = line.strip()
+                # 移除编号（如 "1. "）
+                line = line.lstrip('0123456789.、- ')
+                if line and len(line) > 5:  # 过滤太短的行
+                    suggestions.append(line)
+            
+            return suggestions[:5]  # 最多返回5个
+            
+        except Exception as e:
+            logger.warning(f"推荐问题生成失败: {e}")
+            return self._generate_simple_suggestions(documents)
+    
+    def _generate_simple_suggestions(self, documents: List) -> List[str]:
+        """
+        基于文档内容生成简单的问题推荐（不使用LLM）
+        
+        Args:
+            documents: 检索到的文档
+            
+        Returns:
+            推荐问题列表
+        """
+        suggestions = []
+        categories = set()
+        filenames = set()
+        
+        # 收集文档信息
+        for doc in documents[:3]:
+            if 'category' in doc.metadata:
+                categories.add(doc.metadata['category'])
+            if 'filename' in doc.metadata:
+                filenames.add(doc.metadata['filename'])
+        
+        # 生成基于分类的问题
+        if categories:
+            cat = list(categories)[0]
+            suggestions.append(f"还有哪些关于{cat}的内容？")
+        
+        # 生成基于文件的问题
+        if len(filenames) > 1:
+            suggestions.append(f"这些文档之间有什么联系？")
+        
+        # 通用问题
+        suggestions.append("能否提供更详细的说明？")
+        suggestions.append("有相关的示例吗？")
+        
+        return suggestions[:3]
 
     def search_knowledge(self, query: str, mode: str = "混合检索", top_k: int = 5, progress=gr.Progress()) -> str:
         """
