@@ -356,19 +356,21 @@ class KnowledgeManagerApp:
             # 构建上下文查询（结合最近3轮对话）
             context_query = message
             if history and len(history) >= 2:
-                # 获取最近3轮对话（6条消息）
+                # 获取最近3轮对话的用户问题（不包含AI回答，避免噪音）
                 recent_history = history[-6:] if len(history) > 6 else history
-                context_parts = []
+                user_questions = []
                 for msg in recent_history:
                     if msg['role'] == 'user':
-                        context_parts.append(f"用户: {msg['content']}")
-                    elif msg['role'] == 'assistant':
-                        # 只保留简短摘要，不包含完整回答
-                        content = msg['content'][:100] if len(msg['content']) > 100 else msg['content']
-                        context_parts.append(f"助手: {content}")
+                        user_questions.append(msg['content'])
                 
-                # 组合查询（当前问题 + 上下文）
-                context_query = f"{' '.join(context_parts[-2:])} {message}"
+                # 组合查询：最近2个用户问题 + 当前问题
+                if len(user_questions) >= 2:
+                    context_query = f"{user_questions[-2]} {user_questions[-1]} {message}"
+                elif len(user_questions) == 1:
+                    context_query = f"{user_questions[-1]} {message}"
+                else:
+                    context_query = message
+                
                 logger.info(f"使用上下文查询: {context_query[:100]}...")
 
             # 检索相关文档
