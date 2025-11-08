@@ -6,7 +6,7 @@ Gradio用户界面
 import os
 import logging
 import gradio as gr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -16,6 +16,7 @@ from src.ingestion.document_classifier import DocumentClassifier  # 使用独立
 from src.storage.vector_store_simple import VectorStore, HybridRetriever
 from src.generation.llm_manager import LLMManager, RAGGenerator, ModelRouter
 from src.utils.search_history import SearchHistoryManager
+from src.utils.conversation_db import ConversationDatabase
 
 # 获取日志器（日志已在main.py中统一配置）
 logger = logging.getLogger(__name__)
@@ -55,6 +56,9 @@ class KnowledgeManagerApp:
 
         # 搜索历史管理器
         self.search_history_manager = SearchHistoryManager()
+        
+        # 对话历史数据库
+        self.conversation_db = ConversationDatabase()
 
         # 状态管理
         self.conversation_history = []
@@ -343,6 +347,11 @@ class KnowledgeManagerApp:
                 return "请输入您的问题。"
 
             logger.info(f"收到用户问题: {message[:50]}..., 历史轮数: {len(history)//2 if history else 0}")
+            
+            # 确保有当前会话
+            if not self.current_session_id:
+                self.current_session_id = self.conversation_db.create_session()
+                logger.info(f"创建新会话: {self.current_session_id}")
 
             # 构建上下文查询（结合最近3轮对话）
             context_query = message
@@ -431,6 +440,15 @@ class KnowledgeManagerApp:
                     answer = "".join(answer_parts)
 
                     logger.info(f"AI 回答生成完成: 查询='{message[:30]}...', 置信度={result['confidence']:.2f}, 使用上下文={len(conversation_context)}条")
+                    
+                    # 保存对话到数据库
+                    try:
+                        self.conversation_db.add_message(self.current_session_id, 'user', message)
+                        self.conversation_db.add_message(self.current_session_id, 'assistant', answer)
+                        logger.debug(f"对话已保存到数据库: {self.current_session_id}")
+                    except Exception as db_error:
+                        logger.warning(f"保存对话失败: {db_error}")
+                    
                     return answer
 
                 except Exception as e:
@@ -471,6 +489,15 @@ class KnowledgeManagerApp:
             answer = "".join(answer_parts)
 
             logger.info(f"搜索完成，找到 {len(retrieved_docs)} 个相关文档")
+            
+            # 保存对话到数据库
+            try:
+                self.conversation_db.add_message(self.current_session_id, 'user', message)
+                self.conversation_db.add_message(self.current_session_id, 'assistant', answer)
+                logger.debug(f"对话已保存到数据库: {self.current_session_id}")
+            except Exception as db_error:
+                logger.warning(f"保存对话失败: {db_error}")
+            
             return answer
 
         except Exception as e:
@@ -1001,6 +1028,111 @@ class KnowledgeManagerApp:
         except Exception as e:
             logger.error(f"获取统计信息失败: {str(e)}")
             return f"获取统计信息失败: {str(e)}"
+    
+    def get_session_list(self) -> List[Tuple[str, str]]:
+        """
+        获取会话列表（用于下拉菜单）
+        
+        Returns:
+            (显示名称, session_id) 的元组列表
+        """
+        try:
+            sessions = self.conversation_db.get_all_sessions(limit=100)
+            
+            session_choices = [("新对话", "new")]
+            
+            for session in sessions:
+                title = session['title']
+                session_id = session['session_id']
+                # 格式化显示：标题 (最后活跃时间)
+                last_active = session['last_active'][:16] if session['last_active'] else ''
+                display_name = f"{title} ({last_active})"
+                session_choices.append((display_name, session_id))
+            
+            return session_choices
+            
+        except Exception as e:
+            logger.error(f"获取会话列表失败: {e}")
+            return [("新对话", "new")]
+    
+    def switch_session(self, session_choice: str) -> Tuple[List[Dict], str]:
+        """
+        切换会话
+        
+        Args:
+            session_choice: 选择的session_id（"new"表示新建）
+            
+        Returns:
+            (对话历史, 状态消息)
+        """
+        try:
+            if session_choice == "new" or not session_choice:
+                # 创建新会话
+                self.current_session_id = self.conversation_db.create_session()
+                logger.info(f"创建新会话: {self.current_session_id}")
+                return [], f"✅ 已创建新对话"
+            
+            # 加载现有会话
+            messages = self.conversation_db.get_session_messages(session_choice)
+            
+            if not messages:
+                return [], f"⚠️ 会话不存在或无消息"
+            
+            # 转换为Gradio格式
+            history = []
+            for msg in messages:
+                history.append({
+                    'role': msg['role'],
+                    'content': msg['content']
+                })
+            
+            self.current_session_id = session_choice
+            session_info = self.conversation_db.get_session_info(session_choice)
+            title = session_info['title'] if session_info else "未知会话"
+            
+            logger.info(f"切换到会话: {session_choice} - {title}")
+            return history, f"✅ 已加载会话：{title}\n\n📊 消息数：{len(messages)}"
+            
+        except Exception as e:
+            logger.error(f"切换会话失败: {e}")
+            return [], f"❌ 切换失败: {str(e)}"
+    
+    def delete_current_session(self, session_choice: str) -> str:
+        """
+        删除当前选中的会话
+        
+        Args:
+            session_choice: 要删除的session_id
+            
+        Returns:
+            删除结果消息
+        """
+        try:
+            if session_choice == "new" or not session_choice:
+                return "⚠️ 无法删除'新对话'选项"
+            
+            session_info = self.conversation_db.get_session_info(session_choice)
+            if not session_info:
+                return "⚠️ 会话不存在"
+            
+            title = session_info['title']
+            
+            # 删除会话
+            success = self.conversation_db.delete_session(session_choice)
+            
+            if success:
+                # 如果删除的是当前会话，重置状态
+                if self.current_session_id == session_choice:
+                    self.current_session_id = None
+                
+                logger.info(f"删除会话: {session_choice} - {title}")
+                return f"✅ 已删除会话：{title}"
+            else:
+                return "❌ 删除失败"
+            
+        except Exception as e:
+            logger.error(f"删除会话失败: {e}")
+            return f"❌ 删除失败: {str(e)}"
 
     def create_interface(self) -> gr.Interface:
         """创建Gradio界面"""
@@ -1054,6 +1186,35 @@ class KnowledgeManagerApp:
 
                 # Tab 2: 智能问答
                 with gr.TabItem("💬 智能问答"):
+                    # 会话管理
+                    gr.Markdown("### 📚 会话管理")
+                    
+                    with gr.Row():
+                        with gr.Column(scale=4):
+                            session_selector = gr.Dropdown(
+                                label="💬 选择会话",
+                                choices=[("新对话", "new")],
+                                value="new",
+                                interactive=True,
+                                allow_custom_value=False
+                            )
+                        with gr.Column(scale=1):
+                            new_session_btn = gr.Button("🆕 新建", size="sm")
+                        with gr.Column(scale=1):
+                            delete_session_btn = gr.Button("🗑️ 删除", size="sm", variant="stop")
+                        with gr.Column(scale=1):
+                            refresh_session_btn = gr.Button("🔄 刷新", size="sm")
+                    
+                    session_status = gr.Textbox(
+                        label="会话状态",
+                        lines=2,
+                        max_lines=3,
+                        visible=False  # 默认隐藏，有消息时显示
+                    )
+                    
+                    gr.Markdown("---")
+                    
+                    # 对话界面
                     chatbot = gr.Chatbot(
                         label="对话历史",
                         height=500,
@@ -1130,6 +1291,59 @@ class KnowledgeManagerApp:
                     clear_btn.click(
                         clear_chat,
                         outputs=[chatbot]
+                    )
+                    
+                    # 会话管理事件
+                    def load_session_list():
+                        """加载会话列表"""
+                        choices = self.get_session_list()
+                        return gr.Dropdown(choices=choices)
+                    
+                    def handle_session_switch(session_choice):
+                        """处理会话切换"""
+                        history, status = self.switch_session(session_choice)
+                        return history, status, gr.Textbox(visible=True if status else False)
+                    
+                    def handle_new_session():
+                        """处理新建会话"""
+                        self.current_session_id = None
+                        return [], "✅ 准备创建新对话", gr.Textbox(visible=True), load_session_list()
+                    
+                    def handle_delete_session(session_choice):
+                        """处理删除会话"""
+                        status = self.delete_current_session(session_choice)
+                        return [], status, gr.Textbox(visible=True), load_session_list()
+                    
+                    # 刷新会话列表
+                    refresh_session_btn.click(
+                        load_session_list,
+                        outputs=[session_selector]
+                    )
+                    
+                    # 切换会话
+                    session_selector.change(
+                        handle_session_switch,
+                        inputs=[session_selector],
+                        outputs=[chatbot, session_status, session_status]
+                    )
+                    
+                    # 新建会话
+                    new_session_btn.click(
+                        handle_new_session,
+                        outputs=[chatbot, session_status, session_status, session_selector]
+                    )
+                    
+                    # 删除会话
+                    delete_session_btn.click(
+                        handle_delete_session,
+                        inputs=[session_selector],
+                        outputs=[chatbot, session_status, session_status, session_selector]
+                    )
+                    
+                    # 页面加载时初始化会话列表
+                    demo.load(
+                        load_session_list,
+                        outputs=[session_selector]
                     )
 
                 # Tab 3: 搜索功能

@@ -9,7 +9,6 @@ from typing import List, Optional, Dict, Any
 from pathlib import Path
 import PyPDF2
 from docx import Document
-from langchain.text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document as LangChainDocument
 from config.settings import settings
 
