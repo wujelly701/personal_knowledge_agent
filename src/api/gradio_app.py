@@ -11,7 +11,8 @@ from pathlib import Path
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from config.settings import settings
-from src.ingestion.document_loader_simple import DocumentLoader, DocumentClassifier
+from src.ingestion.document_loader_simple import DocumentLoader
+from src.ingestion.document_classifier import DocumentClassifier  # 使用独立的智能分类器
 from src.storage.vector_store_simple import VectorStore, HybridRetriever
 from src.generation.llm_manager import LLMManager, RAGGenerator, ModelRouter
 from src.utils.search_history import SearchHistoryManager
