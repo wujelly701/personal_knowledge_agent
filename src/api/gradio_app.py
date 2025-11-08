@@ -602,6 +602,9 @@ class KnowledgeManagerApp:
             # 构建搜索结果
             result = f"🔍 **搜索结果** (共找到 {len(documents)} 个相关文档块):\n\n"
 
+            # 提取查询关键词（用于高亮）
+            query_keywords = query.lower().split()
+            
             for i, doc in enumerate(documents, 1):
                 filename = doc.metadata.get('filename', '未知文件')
                 category = doc.metadata.get('category', '未分类')
@@ -609,12 +612,50 @@ class KnowledgeManagerApp:
                 total_chunks = doc.metadata.get('total_chunks', '?')
                 relevance = doc.metadata.get('relevance_score', 0.0)
                 
-                content_preview = doc.page_content[:200].strip()
-                if len(doc.page_content) > 200:
+                # 处理内容预览（关键词高亮）
+                content = doc.page_content
+                content_preview = content[:300].strip()
+                
+                # 高亮关键词（使用**关键词**格式）
+                for keyword in query_keywords:
+                    if len(keyword) > 1:  # 跳过单字符
+                        # 不区分大小写的替换
+                        import re
+                        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+                        content_preview = pattern.sub(f"**{keyword}**", content_preview)
+                
+                if len(content) > 300:
                     content_preview += "..."
 
                 result += f"**{i}. {filename}** (第{chunk_id + 1}/{total_chunks}块 | {category})\n"
-                result += f"   📊 相关性: {relevance:.2f}\n"
+                result += f"   📊 相关性: {relevance:.2f}"
+                
+                # 添加相关性解释
+                relevance_reasons = []
+                if mode == "混合检索":
+                    # 检查关键词匹配
+                    matched_keywords = [kw for kw in query_keywords if len(kw) > 1 and kw in content.lower()]
+                    if matched_keywords:
+                        relevance_reasons.append(f"关键词匹配: {', '.join(matched_keywords[:3])}")
+                    
+                    # 检查语义相似度
+                    if relevance > 0.7:
+                        relevance_reasons.append("高语义相似度")
+                    elif relevance > 0.5:
+                        relevance_reasons.append("中等语义相似度")
+                else:
+                    # 纯语义检索
+                    if relevance > 0.8:
+                        relevance_reasons.append("语义高度相关")
+                    elif relevance > 0.6:
+                        relevance_reasons.append("语义相关")
+                    else:
+                        relevance_reasons.append("语义部分相关")
+                
+                if relevance_reasons:
+                    result += f" ({', '.join(relevance_reasons)})"
+                result += "\n"
+                
                 result += f"   📝 内容预览: {content_preview}\n\n"
 
             result += f"\n💡 *搜索模式: {mode} | 返回{len(documents)}个结果*"
